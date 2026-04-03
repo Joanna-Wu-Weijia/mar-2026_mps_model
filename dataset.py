@@ -18,7 +18,7 @@ Key design decisions that match the original exactly:
        corr_long   (k=20): Pearson of [today, t+1..20]
                            → same thresholds as corr_mid
 
-What differs from the original (intentional):
+What differs:
   - We sample up to PAIRS_PER_DATE pairs per date rather than one fixed pair
     per stock; this gives the encoder more diverse co-movement signal per pass.
   - Data source is qlib D.features() instead of qsdata.get_price().
