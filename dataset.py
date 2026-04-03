@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import random
+from datetime import datetime, timedelta
 from typing import List, Tuple
 
 import numpy as np
@@ -122,9 +123,7 @@ def _build_windows(
 
         stock_wins: dict[pd.Timestamp, np.ndarray] = {}
         for i in range(seq_len - 1, len(dates)):
-            win = vals[i - seq_len + 1 : i + 1]
-            if win.shape[0] == seq_len:
-                stock_wins[dates[i]] = win
+            stock_wins[dates[i]] = vals[i - seq_len + 1 : i + 1]
 
         if stock_wins:
             windows[stock] = stock_wins
@@ -146,20 +145,11 @@ def _pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(a, b)[0, 1])
 
 
-def _corr_short_label(corr: float) -> int:
-    """1-day horizon: corr >= 2/3 → 1 (positive), <= -1/3 → 2 (negative), else 0."""
-    if corr >= 2 / 3:
+def _corr_label(corr: float, pos_hi: float, neg_lo: float) -> int:
+    """Map correlation to {0,1,2}: strong positive → 1, strong negative → 2, else 0."""
+    if corr >= pos_hi:
         return 1
-    if corr <= -1 / 3:
-        return 2
-    return 0
-
-
-def _corr_mid_long_label(corr: float) -> int:
-    """5-/20-day horizon: corr >= 0.5 → 1, <= -0.5 → 2, else 0."""
-    if corr >= 0.5:
-        return 1
-    if corr <= -0.5:
+    if corr <= neg_lo:
         return 2
     return 0
 
@@ -193,19 +183,19 @@ def _future_corr_labels(
     arr_short_a = np.array([1.0, row_a[0]])   # today=1.0, t+1
     arr_short_b = np.array([1.0, row_b[0]])
     c_short = _pearson_corr(arr_short_a, arr_short_b)
-    l_short = _corr_short_label(c_short)
+    l_short = _corr_label(c_short, 2 / 3, -1 / 3)
 
     # mid: next 5 days → 6 points: [1.0, fwd_1..5]
     arr_mid_a = np.concatenate([[1.0], row_a[:5]])
     arr_mid_b = np.concatenate([[1.0], row_b[:5]])
-    c_mid  = _pearson_corr(arr_mid_a, arr_mid_b)
-    l_mid  = _corr_mid_long_label(c_mid)
+    c_mid = _pearson_corr(arr_mid_a, arr_mid_b)
+    l_mid = _corr_label(c_mid, 0.5, -0.5)
 
     # long: next 20 days → 21 points: [1.0, fwd_1..20]
     arr_long_a = np.concatenate([[1.0], row_a])
     arr_long_b = np.concatenate([[1.0], row_b])
     c_long = _pearson_corr(arr_long_a, arr_long_b)
-    l_long = _corr_mid_long_label(c_long)
+    l_long = _corr_label(c_long, 0.5, -0.5)
 
     return l_short, l_mid, l_long
 
@@ -246,7 +236,8 @@ class PairDataset(Dataset):
             n = min(pairs_per_date, len(avail) * (len(avail) - 1) // 2)
             sampled = set()
             attempts = 0
-            while len(self.X_A) - (len(self.X_A) - len(self.y1)) < n and attempts < n * 5:
+            pairs_added = 0
+            while pairs_added < n and attempts < n * 5:
                 attempts += 1
                 a, b = rng.sample(avail, 2)
                 key  = (min(a, b), max(a, b))
@@ -263,6 +254,7 @@ class PairDataset(Dataset):
                 self.y1.append(labels[0])
                 self.y2.append(labels[1])
                 self.y3.append(labels[2])
+                pairs_added += 1
 
     def __len__(self) -> int:
         return len(self.y1)
@@ -316,7 +308,7 @@ class StockDataset(Dataset):
                 continue
 
             # cross-sectional rank: 0 = worst, 1 = best
-            sorted_stocks = sorted(day_rets, key=day_rets.get)  # type: ignore
+            sorted_stocks = sorted(day_rets, key=lambda s: day_rets[s])
             n = len(sorted_stocks)
             rank_map = {s: i / (n - 1) for i, s in enumerate(sorted_stocks)}
 
@@ -351,9 +343,8 @@ def build_datasets(
     print("Loading features from qlib …")
     # Load a buffer of extra history before TRAIN_START so the first window
     # on TRAIN_START has enough look-back data.
-    from datetime import datetime as _dt, timedelta
     history_start = (
-        _dt.strptime(config.TRAIN_START, "%Y-%m-%d")
+        datetime.strptime(config.TRAIN_START, "%Y-%m-%d")
         - timedelta(days=seq_len * 2)
     ).strftime("%Y-%m-%d")
 
