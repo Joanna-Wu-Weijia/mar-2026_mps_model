@@ -1,7 +1,6 @@
-# MPS – Multi-scale Price-movement Similarity (qlib edition)
+# MPS – Multi-scale Price-movement Similarity
 
-Adaptation of [ECNU-CILAB/MPS](https://github.com/ECNU-CILAB/MPS) for local
-qlib data with **IC / IR** as primary evaluation metrics.
+[ECNU-CILAB/MPS](https://github.com/ECNU-CILAB/MPS) 
 
 ---
 
