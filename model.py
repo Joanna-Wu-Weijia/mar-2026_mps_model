@@ -7,8 +7,6 @@ Stage-1  : MultiTask  – three shared transformer encoders trained with a
 
 Stage-2  : GRU_Predict – bidirectional GRU on top of the frozen encoder
            that outputs a single score for next-day return ranking.
-
-Reference: https://github.com/ECNU-CILAB/MPS
 """
 
 import torch
