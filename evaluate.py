@@ -11,9 +11,7 @@ Metrics reported
   Sharpe    Annualised Sharpe Ratio of the long-top-K portfolio
               (daily returns of the top TOP_K_PCT stocks by predicted score)
 
-Usage
-─────
-    python evaluate.py          # evaluates saved models on the test set
+    python evaluate.py    
 """
 
 from __future__ import annotations
