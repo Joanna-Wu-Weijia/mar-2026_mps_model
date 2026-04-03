@@ -1,21 +1,30 @@
 """
 Data loading and preprocessing for the MPS model using local qlib data.
 
-Data directory layout (QLIB_DATA_PATH in config.py):
-    my_qlib_data/
-    ├── calendars/day.txt
-    ├── features/<stock>/*.day.bin
-    └── instruments/csi300.txt ...
+Processing pipeline mirrors build_data.ipynb from ECNU-CILAB/MPS, except
+that raw data comes from a local qlib store instead of qsdata.
 
-Datasets produced:
-  PairDataset   – stage-1 (MultiTask co-movement pre-training)
-  StockDataset  – stage-2 (GRU_Predict return-ranking training / evaluation)
+Key design decisions that match the original exactly:
+  1. Features    : raw OHLCV ["open","close","high","low","turnover","volume"]
+  2. Zero-filter : drop rows where volume=0 or turnover=0  (original: same)
+  3. Normalisation:
+       - Training slice → 3-sigma clip, then z-score (fit on train)
+       - Test slice     → apply the SAME clip bounds + mean/std from train
+                          (no data leakage, matches ds_filter_extreme_3sigma
+                          + ds_standardize_zscore in the original)
+  4. Windows     : 20-day rolling windows, newest-first  (matches original)
+  5. Co-movement labels (stage-1 pretext task):
+       corr_short  (k=1) : Pearson of [today, t+1] close prices
+                           → 1 if ≥ 2/3, 2 if ≤ −1/3, else 0
+       corr_mid    (k=5) : Pearson of [today, t+1..5]
+                           → 1 if ≥ 0.5, 2 if ≤ −0.5, else 0
+       corr_long   (k=20): Pearson of [today, t+1..20]
+                           → same thresholds as corr_mid
 
-Co-movement labels (paper Section 3, original build_data.ipynb):
-  Pearson correlation of FUTURE close price sequences between stock pairs.
-  k_short=1, k_mid=5, k_long=20 trading days.
-  Label encoding: 0=uncorrelated, 1=positive co-movement, 2=negative co-movement
-  Boundaries: short → r1=2/3, r2=-1/3 | mid/long → r1=0.5, r2=-0.5
+What differs from the original (intentional):
+  - We sample up to PAIRS_PER_DATE pairs per date rather than one fixed pair
+    per stock; this gives the encoder more diverse co-movement signal per pass.
+  - Data source is qlib D.features() instead of qsdata.get_price().
 """
 
 from __future__ import annotations
@@ -23,7 +32,7 @@ from __future__ import annotations
 import math
 import random
 from datetime import datetime, timedelta
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,10 +59,11 @@ def init_qlib() -> None:
 
 def load_raw_data(start: str, end: str) -> pd.DataFrame:
     """
-    Load 6 historical features + 1-day forward return label
+    Load raw OHLCV features + 1-day forward return label
     + 20 future close ratios (for co-movement labels in stage-1).
 
     Returns DataFrame with MultiIndex (instrument, datetime).
+    Rows where volume=0 or turnover=0 are dropped (same as original).
     """
     instruments = D.instruments(config.UNIVERSE)
 
@@ -68,30 +78,99 @@ def load_raw_data(start: str, end: str) -> pd.DataFrame:
                     start_time=start, end_time=end, freq="day")
     df.columns = names
     df.index.names = ["instrument", "datetime"]
+
+    # Drop illiquid days: volume=0 or turnover=0 (build_data.ipynb line 1)
+    df = df[(df["volume"] > 0) & (df["turnover"] > 0)]
     return df
 
 
 # ---------------------------------------------------------------------------
-# Per-stock z-score normalisation with 3-sigma clip
+# Global normalisation  (mirrors build_data.ipynb normalisation block)
 # ---------------------------------------------------------------------------
 
-def _zscore_clip(x: np.ndarray) -> np.ndarray:
-    mu  = np.nanmean(x, axis=0, keepdims=True)
-    std = np.nanstd(x,  axis=0, keepdims=True) + 1e-8
-    return np.clip((x - mu) / std, -3.0, 3.0).astype(np.float32)
+class GlobalNormaliser:
+    """
+    Fits 3-sigma clip bounds + z-score (mean, std) on training data,
+    then transforms both train and test slices using those same parameters.
+
+    Mirrors ds_filter_extreme_3sigma() + ds_standardize_zscore() from the
+    original, applied globally (not per-stock) for each feature column.
+    """
+
+    def __init__(self, n_sigma: float = 3.0):
+        self.n_sigma = n_sigma
+        self.params: Dict[str, Dict] = {}   # {col: {min, max, mean, std}}
+
+    def fit_transform(
+        self, df: pd.DataFrame, cols: List[str]
+    ) -> pd.DataFrame:
+        """Fit on df and return the clipped+normalised copy."""
+        df = df.copy()
+        for col in cols:
+            s    = df[col].dropna()
+            mean = float(s.mean())
+            std  = float(s.std())
+            lo   = mean - self.n_sigma * std
+            hi   = mean + self.n_sigma * std
+
+            df[col] = df[col].clip(lo, hi)
+            df[col] = (df[col] - mean) / (std + 1e-8)
+
+            self.params[col] = dict(mean=mean, std=std, lo=lo, hi=hi)
+
+        return df
+
+    def transform(
+        self, df: pd.DataFrame, cols: List[str]
+    ) -> pd.DataFrame:
+        """Apply previously fitted parameters to a new slice."""
+        df = df.copy()
+        for col in cols:
+            p    = self.params[col]
+            # same clip range from train, same mean/std from train
+            df[col] = df[col].clip(p["lo"], p["hi"])
+            df[col] = (df[col] - p["mean"]) / (p["std"] + 1e-8)
+        return df
+
+
+def normalise_split(
+    df: pd.DataFrame,
+    train_end: str,
+    cols: List[str],
+) -> Tuple[pd.DataFrame, GlobalNormaliser]:
+    """
+    Fit normaliser on rows up to train_end, transform the whole df.
+    Returns the normalised df and the fitted normaliser.
+    """
+    split = pd.Timestamp(train_end)
+    dates = df.index.get_level_values("datetime")
+
+    train_mask = dates <= split
+    test_mask  = dates >  split
+
+    norm = GlobalNormaliser()
+
+    train_part = norm.fit_transform(df[train_mask], cols)
+    test_part  = norm.transform(df[test_mask], cols)
+
+    return pd.concat([train_part, test_part]).sort_index(), norm
 
 
 # ---------------------------------------------------------------------------
 # Window builder  →  {stock: {date: np.ndarray(seq_len, n_features)}}
+#
+# Window order: newest-first  [today, t-1, …, t-19]
+# This matches the original:
+#   daily20_features = [features, features-1, …, features-19]
 # ---------------------------------------------------------------------------
 
 def _build_windows(
     df: pd.DataFrame,
     stocks: List[str],
     seq_len: int,
-) -> dict[str, dict[pd.Timestamp, np.ndarray]]:
+) -> Dict[str, Dict[pd.Timestamp, np.ndarray]]:
     feat_cols = config.FEATURE_NAMES
-    windows: dict[str, dict[pd.Timestamp, np.ndarray]] = {}
+    windows: Dict[str, Dict[pd.Timestamp, np.ndarray]] = {}
 
     for stock in stocks:
         if stock not in df.index.get_level_values("instrument"):
@@ -101,12 +180,15 @@ def _build_windows(
         if len(sub) < seq_len:
             continue
 
-        vals  = _zscore_clip(sub.values)
+        vals  = sub.values.astype(np.float32)
         dates = sub.index.tolist()
 
-        stock_wins: dict[pd.Timestamp, np.ndarray] = {}
+        stock_wins: Dict[pd.Timestamp, np.ndarray] = {}
         for i in range(seq_len - 1, len(dates)):
-            stock_wins[dates[i]] = vals[i - seq_len + 1 : i + 1]
+            # newest-first: [today, t-1, …, t-seq_len+1]
+            win = vals[i : i - seq_len : -1]   # shape (seq_len, n_features)
+            if win.shape[0] == seq_len:
+                stock_wins[dates[i]] = win
 
         if stock_wins:
             windows[stock] = stock_wins
@@ -115,7 +197,7 @@ def _build_windows(
 
 
 # ---------------------------------------------------------------------------
-# Co-movement label helpers  (paper Section 3)
+# Co-movement label helpers  (paper Section 3 / build_data.ipynb)
 # ---------------------------------------------------------------------------
 
 def _pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
@@ -125,7 +207,7 @@ def _pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _short_label(corr: float) -> int:
-    """k=1  boundary r1=2/3, r2=-1/3"""
+    """k=1: r1=2/3, r2=-1/3"""
     if corr >= 2 / 3:
         return 1
     if corr <= -1 / 3:
@@ -134,7 +216,7 @@ def _short_label(corr: float) -> int:
 
 
 def _mid_long_label(corr: float) -> int:
-    """k=5,20  boundary r1=0.5, r2=-0.5"""
+    """k=5,20: r1=0.5, r2=-0.5"""
     if corr >= 0.5:
         return 1
     if corr <= -0.5:
@@ -147,12 +229,14 @@ def _future_corr_labels(
     stock_a: str,
     stock_b: str,
     date: pd.Timestamp,
-) -> Tuple[int, int, int] | None:
+) -> Optional[Tuple[int, int, int]]:
     """
-    Compute co-movement labels using future close price ratios.
-    Returns (label_short, label_mid, label_long) or None if data missing.
+    Compute co-movement labels from FUTURE close price ratios.
+    fwd_close_i = Ref($close,-i)/$close  → normalised future close sequence.
+
+    Returns (label_short, label_mid, label_long) or None if data is missing.
     """
-    fwd_cols = config.FUTURE_CLOSE_NAMES   # fwd_close_1 … fwd_close_20
+    fwd_cols = config.FUTURE_CLOSE_NAMES
     try:
         row_a = df.loc[(stock_a, date), fwd_cols].values.astype(float)
         row_b = df.loc[(stock_b, date), fwd_cols].values.astype(float)
@@ -162,20 +246,20 @@ def _future_corr_labels(
     if np.any(np.isnan(row_a)) or np.any(np.isnan(row_b)):
         return None
 
-    # short (k=1): 2-point sequence [today=1.0, t+1]
-    a_short = np.array([1.0, row_a[0]])
-    b_short = np.array([1.0, row_b[0]])
-    l_short = _short_label(_pearson_corr(a_short, b_short))
+    # short (k=1): 2 points [today=1.0, t+1]
+    l_short = _short_label(
+        _pearson_corr(np.array([1.0, row_a[0]]),
+                      np.array([1.0, row_b[0]])))
 
-    # mid (k=5): 6-point sequence [1.0, fwd_1..5]
-    a_mid = np.concatenate([[1.0], row_a[:5]])
-    b_mid = np.concatenate([[1.0], row_b[:5]])
-    l_mid = _mid_long_label(_pearson_corr(a_mid, b_mid))
+    # mid (k=5): 6 points [1.0, fwd_1..5]
+    l_mid = _mid_long_label(
+        _pearson_corr(np.concatenate([[1.0], row_a[:5]]),
+                      np.concatenate([[1.0], row_b[:5]])))
 
-    # long (k=20): 21-point sequence [1.0, fwd_1..20]
-    a_long = np.concatenate([[1.0], row_a])
-    b_long = np.concatenate([[1.0], row_b])
-    l_long = _mid_long_label(_pearson_corr(a_long, b_long))
+    # long (k=20): 21 points [1.0, fwd_1..20]
+    l_long = _mid_long_label(
+        _pearson_corr(np.concatenate([[1.0], row_a]),
+                      np.concatenate([[1.0], row_b])))
 
     return l_short, l_mid, l_long
 
@@ -187,13 +271,13 @@ def _future_corr_labels(
 class PairDataset(Dataset):
     """
     Each sample: (window_A, window_B, label_short, label_mid, label_long)
-      windows : float32  (seq_len, n_features)
-      labels  : int64    {0, 1, 2}
+      windows : float32  (seq_len, n_features)   newest-first
+      labels  : int64    {0=uncorrelated, 1=positive, 2=negative}
     """
 
     def __init__(
         self,
-        windows:        dict[str, dict[pd.Timestamp, np.ndarray]],
+        windows:        Dict[str, Dict[pd.Timestamp, np.ndarray]],
         df:             pd.DataFrame,
         dates:          List[pd.Timestamp],
         pairs_per_date: int = config.PAIRS_PER_DATE,
@@ -215,8 +299,8 @@ class PairDataset(Dataset):
 
             n        = min(pairs_per_date, len(avail) * (len(avail) - 1) // 2)
             sampled  = set()
-            attempts = 0
             added    = 0
+            attempts = 0
             while added < n and attempts < n * 5:
                 attempts += 1
                 a, b = rng.sample(avail, 2)
@@ -224,11 +308,9 @@ class PairDataset(Dataset):
                 if key in sampled:
                     continue
                 sampled.add(key)
-
                 labels = _future_corr_labels(df, a, b, date)
                 if labels is None:
                     continue
-
                 self.X_A.append(windows[a][date])
                 self.X_B.append(windows[b][date])
                 self.y1.append(labels[0])
@@ -256,18 +338,18 @@ class PairDataset(Dataset):
 class StockDataset(Dataset):
     """
     Each sample: (window, rank_label, raw_return)
-      window      : float32  (seq_len, n_features)
-      rank_label  : float32  cross-sectional rank in [0, 1]  (training target)
-      raw_return  : float32  actual 1-day forward return     (for Sharpe/IC)
+      window      : float32  (seq_len, n_features)  newest-first
+      rank_label  : float32  cross-sectional rank [0,1]  (training target)
+      raw_return  : float32  actual 1-day forward return (for IC / Sharpe)
 
-    Also exposes:
-      self.dates         : List[pd.Timestamp]  – date for each sample
-      self.raw_returns   : List[float]         – raw forward return per sample
+    Attributes:
+      self.dates       : List[pd.Timestamp]   date for each sample
+      self.raw_returns : List[float]          raw return for each sample
     """
 
     def __init__(
         self,
-        windows: dict[str, dict[pd.Timestamp, np.ndarray]],
+        windows: Dict[str, Dict[pd.Timestamp, np.ndarray]],
         df:      pd.DataFrame,
         dates:   List[pd.Timestamp],
     ):
@@ -279,7 +361,7 @@ class StockDataset(Dataset):
         stocks = list(windows.keys())
 
         for date in dates:
-            day_rets: dict[str, float] = {}
+            day_rets: Dict[str, float] = {}
             for stock in stocks:
                 if date not in windows.get(stock, {}):
                     continue
@@ -294,7 +376,8 @@ class StockDataset(Dataset):
                 continue
 
             # cross-sectional rank: 0 = worst return, 1 = best return
-            sorted_s = sorted(day_rets, key=day_rets.get)  # type: ignore
+            # matches groupby('dt')['close_rtn'].rank() / max(rank) in original
+            sorted_s = sorted(day_rets, key=day_rets.get)   # type: ignore
             n        = len(sorted_s)
             rank_map = {s: i / (n - 1) for i, s in enumerate(sorted_s)}
 
@@ -322,22 +405,31 @@ class StockDataset(Dataset):
 def build_datasets(
     seq_len: int = config.SEQ_LEN,
 ) -> Tuple[
-    PairDataset,    # enc_train
-    StockDataset,   # pred_train
-    StockDataset,   # pred_test
-    pd.DataFrame,   # full df (for any post-hoc analysis)
+    PairDataset,
+    StockDataset,
+    StockDataset,
+    pd.DataFrame,
 ]:
-    """Load qlib data and build all datasets. No validation split."""
+    """
+    Load qlib data, normalise (train stats → test), build all datasets.
+    No validation split.
+    """
     init_qlib()
 
     print("Loading features from qlib …")
-    from datetime import datetime as _dt, timedelta
     history_start = (
         datetime.strptime(config.TRAIN_START, "%Y-%m-%d")
         - timedelta(days=seq_len * 2)
     ).strftime("%Y-%m-%d")
 
     df = load_raw_data(history_start, config.TEST_END)
+
+    # ------------------------------------------------------------------ #
+    # Global normalisation – fit on training slice, apply same params     #
+    # to test slice.  Matches build_data.ipynb normalisation block.       #
+    # ------------------------------------------------------------------ #
+    print("Normalising (train-stats applied to test) …")
+    df, _ = normalise_split(df, config.TRAIN_END, config.FEATURE_NAMES)
 
     cal = df.index.get_level_values("datetime").unique().sort_values()
 
@@ -356,7 +448,7 @@ def build_datasets(
     print(f"  Test   : {len(test_dates)} days "
           f"({test_dates[0].date()} → {test_dates[-1].date()})")
 
-    print("Building feature windows …")
+    print("Building feature windows (newest-first, 20-day) …")
     windows = _build_windows(df, stocks, seq_len)
 
     print("Building PairDataset (stage-1 train) …")
