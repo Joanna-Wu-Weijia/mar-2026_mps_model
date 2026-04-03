@@ -1,4 +1,4 @@
-# MPS – Multi-scale Price-movement Similarity (qlib edition)
+# MPS – Multi-scale Price-movement Similarity
 
 Adaptation of [ECNU-CILAB/MPS](https://github.com/ECNU-CILAB/MPS) for local
 qlib data on macOS, with five standard financial evaluation metrics.

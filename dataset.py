@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import random
+from datetime import datetime, timedelta
 from typing import List, Tuple
 
 import numpy as np
@@ -105,9 +106,7 @@ def _build_windows(
 
         stock_wins: dict[pd.Timestamp, np.ndarray] = {}
         for i in range(seq_len - 1, len(dates)):
-            win = vals[i - seq_len + 1 : i + 1]
-            if win.shape[0] == seq_len:
-                stock_wins[dates[i]] = win
+            stock_wins[dates[i]] = vals[i - seq_len + 1 : i + 1]
 
         if stock_wins:
             windows[stock] = stock_wins
@@ -334,7 +333,7 @@ def build_datasets(
     print("Loading features from qlib …")
     from datetime import datetime as _dt, timedelta
     history_start = (
-        _dt.strptime(config.TRAIN_START, "%Y-%m-%d")
+        datetime.strptime(config.TRAIN_START, "%Y-%m-%d")
         - timedelta(days=seq_len * 2)
     ).strftime("%Y-%m-%d")
 
