@@ -7,15 +7,25 @@ Data directory layout (set QLIB_DATA_PATH in config.py):
     ├── features/<stock>/close.day.bin ...
     └── instruments/csi300.txt ...
 
-Two Dataset classes are produced:
-  PairDataset   – used in stage-1 (MultiTask co-movement training)
-  StockDataset  – used in stage-2 (GRU_Predict return-ranking training/eval)
+Two Dataset classes:
+  PairDataset   – stage-1 (MultiTask co-movement pre-training)
+  StockDataset  – stage-2 (GRU_Predict return-ranking training / eval)
+
+Co-movement labels follow the original MPS build_data.ipynb:
+  correlation is computed on FUTURE close price sequences, giving a
+  supervision signal that teaches the encoder about price co-movement.
+
+  Label encoding (0 / 1 / 2):
+    corr_short  (next 1 trading day)  : corr >= 2/3 → 1, corr <= -1/3 → 2, else 0
+    corr_mid    (next 5 trading days) : corr >= 0.5 → 1, corr <= -0.5 → 2, else 0
+    corr_long   (next 20 trading days): corr >= 0.5 → 1, corr <= -0.5 → 2, else 0
 """
 
 from __future__ import annotations
 
+import math
 import random
-from typing import Tuple, List
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -33,31 +43,29 @@ import config
 # ---------------------------------------------------------------------------
 
 def init_qlib() -> None:
-    """Initialise qlib with the local data provider."""
     qlib.init(provider_uri=config.QLIB_DATA_PATH, region="cn")
 
 
 # ---------------------------------------------------------------------------
-# Raw feature loading
+# Raw feature + label loading
 # ---------------------------------------------------------------------------
 
-def load_raw_features(start: str, end: str) -> pd.DataFrame:
+def load_raw_data(start: str, end: str) -> pd.DataFrame:
     """
-    Load 6 normalised daily features for all instruments in the universe.
+    Load 6 historical features  +  1-day forward return label
+    +  20 future close ratios (for co-movement labels in stage-1).
 
-    Returns
-    -------
-    df : pd.DataFrame
-        MultiIndex (instrument, datetime), columns = FEATURE_NAMES + ['label']
-        label = next-day close return (used for ranking in stage-2).
+    Returns a DataFrame with MultiIndex (instrument, datetime).
     """
     instruments = D.instruments(config.UNIVERSE)
 
-    fields = config.FEATURE_FIELDS + [config.LABEL_FIELD]
-    names  = config.FEATURE_NAMES  + [config.LABEL_NAME]
+    fields = (config.FEATURE_FIELDS
+              + [config.LABEL_FIELD]
+              + config.FUTURE_CLOSE_FIELDS)
+    names  = (config.FEATURE_NAMES
+              + [config.LABEL_NAME]
+              + config.FUTURE_CLOSE_NAMES)
 
-    # Add enough history so we can build SEQ_LEN-day windows from start
-    from qlib.utils.time import Freq  # noqa: F401 – side-effects only
     df = D.features(
         instruments,
         fields,
@@ -71,15 +79,14 @@ def load_raw_features(start: str, end: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Normalisation  (z-score per feature, clip at 3σ)
+# Per-stock z-score normalisation with 3-sigma clip
 # ---------------------------------------------------------------------------
 
 def _zscore_clip(x: np.ndarray) -> np.ndarray:
-    """Row-wise (feature-wise) z-score normalisation with 3-sigma clip."""
     mu  = np.nanmean(x, axis=0, keepdims=True)
     std = np.nanstd(x,  axis=0, keepdims=True) + 1e-8
-    x   = (x - mu) / std
-    return np.clip(x, -3.0, 3.0)
+    z   = (x - mu) / std
+    return np.clip(z, -3.0, 3.0).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -92,10 +99,8 @@ def _build_windows(
     seq_len: int,
 ) -> dict[str, dict[pd.Timestamp, np.ndarray]]:
     """
-    For each stock build a mapping  date → feature_window.
-
-    feature_window : np.ndarray of shape (seq_len, n_features)
-    Only dates that have a complete (no-NaN) window of length seq_len are kept.
+    For each stock build:  date → feature_window (seq_len, n_features).
+    Only dates with a complete NaN-free window are kept.
     """
     feat_cols = config.FEATURE_NAMES
     windows: dict[str, dict[pd.Timestamp, np.ndarray]] = {}
@@ -109,16 +114,15 @@ def _build_windows(
             .sort_index()
             .dropna(how="any")
         )
+        if len(sub) < seq_len:
+            continue
+
+        vals  = _zscore_clip(sub.values)
+        dates = sub.index.tolist()
 
         stock_wins: dict[pd.Timestamp, np.ndarray] = {}
-        dates = sub.index.tolist()
-        vals  = sub.values.astype(np.float32)
-
-        # Normalise per-stock across its whole available history
-        vals = _zscore_clip(vals).astype(np.float32)
-
         for i in range(seq_len - 1, len(dates)):
-            win = vals[i - seq_len + 1 : i + 1]   # (seq_len, n_features)
+            win = vals[i - seq_len + 1 : i + 1]
             if win.shape[0] == seq_len:
                 stock_wins[dates[i]] = win
 
@@ -129,44 +133,81 @@ def _build_windows(
 
 
 # ---------------------------------------------------------------------------
-# Co-movement label helpers (stage-1)
+# Co-movement correlation helpers (original MPS convention)
 # ---------------------------------------------------------------------------
 
-def _corr_label(ret_a: np.ndarray, ret_b: np.ndarray) -> int:
-    """
-    Pearson correlation between two return series, binned into 3 classes:
-      0  = negative   (corr < -1/3)
-      1  = neutral    (-1/3 ≤ corr ≤ 1/3)
-      2  = positive   (corr > 1/3)
-    Returns 1 when one or both series have zero variance.
-    """
-    if ret_a.std() < 1e-8 or ret_b.std() < 1e-8:
+def _pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation; returns 0.0 when one series is constant."""
+    if a.std() < 1e-8 or b.std() < 1e-8:
+        return 0.0
+    denom = a.std() * b.std() * len(a)
+    if denom < 1e-8:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _corr_short_label(corr: float) -> int:
+    """1-day horizon: corr >= 2/3 → 1 (positive), <= -1/3 → 2 (negative), else 0."""
+    if corr >= 2 / 3:
         return 1
-    corr = float(np.corrcoef(ret_a, ret_b)[0, 1])
-    if corr < -1 / 3:
-        return 0
-    elif corr > 1 / 3:
+    if corr <= -1 / 3:
         return 2
-    return 1
+    return 0
 
 
-def _corr_labels_for_pair(
-    win_a: np.ndarray, win_b: np.ndarray
-) -> Tuple[int, int, int]:
+def _corr_mid_long_label(corr: float) -> int:
+    """5-/20-day horizon: corr >= 0.5 → 1, <= -0.5 → 2, else 0."""
+    if corr >= 0.5:
+        return 1
+    if corr <= -0.5:
+        return 2
+    return 0
+
+
+def _future_corr_labels(
+    df: pd.DataFrame,
+    stock_a: str,
+    stock_b: str,
+    date: pd.Timestamp,
+) -> Tuple[int, int, int] | None:
     """
-    Compute co-movement labels at three temporal scales using the close-return
-    column (index 3) inside the feature window.
+    Compute co-movement labels using FUTURE close price ratios.
 
-    Returns (corr_short_label, corr_mid_label, corr_long_label).
+    Future close ratio for day i:  Ref($close,-i)/$close
+    Arrays span [close_today, close_t1, ..., close_t20] for each stock.
+
+    Returns (label_short, label_mid, label_long) or None if data missing.
     """
-    close_idx = config.FEATURE_NAMES.index("close_ret")
-    ret_a = win_a[:, close_idx]
-    ret_b = win_b[:, close_idx]
+    fwd_cols = config.FUTURE_CLOSE_NAMES   # fwd_close_1 … fwd_close_20
 
-    c_short = _corr_label(ret_a[-config.CORR_SHORT:],  ret_b[-config.CORR_SHORT:])
-    c_mid   = _corr_label(ret_a[-config.CORR_MID:],    ret_b[-config.CORR_MID:])
-    c_long  = _corr_label(ret_a,                        ret_b)
-    return c_short, c_mid, c_long
+    try:
+        row_a = df.loc[(stock_a, date), fwd_cols].values.astype(float)
+        row_b = df.loc[(stock_b, date), fwd_cols].values.astype(float)
+    except KeyError:
+        return None
+
+    if np.any(np.isnan(row_a)) or np.any(np.isnan(row_b)):
+        return None
+
+    # short: next 1 day  → 2 points: [fwd_close_1] for each stock
+    arr_short_a = np.array([1.0, row_a[0]])   # today=1.0, t+1
+    arr_short_b = np.array([1.0, row_b[0]])
+    c_short = _pearson_corr(arr_short_a, arr_short_b)
+    l_short = _corr_short_label(c_short)
+
+    # mid: next 5 days → 6 points: [1.0, fwd_1..5]
+    arr_mid_a = np.concatenate([[1.0], row_a[:5]])
+    arr_mid_b = np.concatenate([[1.0], row_b[:5]])
+    c_mid  = _pearson_corr(arr_mid_a, arr_mid_b)
+    l_mid  = _corr_mid_long_label(c_mid)
+
+    # long: next 20 days → 21 points: [1.0, fwd_1..20]
+    arr_long_a = np.concatenate([[1.0], row_a])
+    arr_long_b = np.concatenate([[1.0], row_b])
+    c_long = _pearson_corr(arr_long_a, arr_long_b)
+    l_long = _corr_mid_long_label(c_long)
+
+    return l_short, l_mid, l_long
 
 
 # ---------------------------------------------------------------------------
@@ -176,17 +217,17 @@ def _corr_labels_for_pair(
 class PairDataset(Dataset):
     """
     Each sample: (window_A, window_B, label_short, label_mid, label_long)
-
-    windows_A/B : float32 tensors of shape (seq_len, n_features)
-    labels      : int64 tensors  (3 classes each)
+      windows : float32  (seq_len, n_features)
+      labels  : int64    {0, 1, 2}
     """
 
     def __init__(
         self,
-        windows: dict[str, dict[pd.Timestamp, np.ndarray]],
-        dates: List[pd.Timestamp],
+        windows:       dict[str, dict[pd.Timestamp, np.ndarray]],
+        df:            pd.DataFrame,    # full data df with future close cols
+        dates:         List[pd.Timestamp],
         pairs_per_date: int = config.PAIRS_PER_DATE,
-        seed: int = config.SEED,
+        seed:          int  = config.SEED,
     ):
         rng    = random.Random(seed)
         stocks = list(windows.keys())
@@ -198,21 +239,30 @@ class PairDataset(Dataset):
         self.y3:  List[int] = []
 
         for date in dates:
-            # stocks that have a window on this date
-            avail = [s for s in stocks if date in windows[s]]
+            avail = [s for s in stocks if date in windows.get(s, {})]
             if len(avail) < 2:
                 continue
+
             n = min(pairs_per_date, len(avail) * (len(avail) - 1) // 2)
-            for _ in range(n):
+            sampled = set()
+            attempts = 0
+            while len(self.X_A) - (len(self.X_A) - len(self.y1)) < n and attempts < n * 5:
+                attempts += 1
                 a, b = rng.sample(avail, 2)
-                win_a = windows[a][date]
-                win_b = windows[b][date]
-                c1, c2, c3 = _corr_labels_for_pair(win_a, win_b)
-                self.X_A.append(win_a)
-                self.X_B.append(win_b)
-                self.y1.append(c1)
-                self.y2.append(c2)
-                self.y3.append(c3)
+                key  = (min(a, b), max(a, b))
+                if key in sampled:
+                    continue
+                sampled.add(key)
+
+                labels = _future_corr_labels(df, a, b, date)
+                if labels is None:
+                    continue
+
+                self.X_A.append(windows[a][date])
+                self.X_B.append(windows[b][date])
+                self.y1.append(labels[0])
+                self.y2.append(labels[1])
+                self.y3.append(labels[2])
 
     def __len__(self) -> int:
         return len(self.y1)
@@ -233,90 +283,86 @@ class PairDataset(Dataset):
 
 class StockDataset(Dataset):
     """
-    Each sample: (window, label_rank)
-
-    window     : float32 tensor  (seq_len, n_features)
-    label_rank : float32 scalar  – cross-sectional rank (0..1) of forward return
+    Each sample: (window, rank_label)
+      window     : float32  (seq_len, n_features)
+      rank_label : float32  cross-sectional rank in [0, 1]
     """
 
     def __init__(
         self,
-        windows:  dict[str, dict[pd.Timestamp, np.ndarray]],
-        labels_df: pd.DataFrame,   # MultiIndex (instrument, datetime), col 'label'
-        dates:    List[pd.Timestamp],
+        windows:   dict[str, dict[pd.Timestamp, np.ndarray]],
+        df:        pd.DataFrame,   # needs 'label' column (1-day fwd return)
+        dates:     List[pd.Timestamp],
     ):
-        self.windows:  List[np.ndarray] = []
-        self.labels:   List[float]      = []
+        self.X: List[np.ndarray] = []
+        self.y: List[float]      = []
 
         stocks = list(windows.keys())
 
         for date in dates:
-            # forward-return for all available stocks on this date
-            day_labels: dict[str, float] = {}
+            # gather forward returns for all stocks available on this date
+            day_rets: dict[str, float] = {}
             for stock in stocks:
+                if date not in windows.get(stock, {}):
+                    continue
                 try:
-                    val = labels_df.loc[(stock, date), config.LABEL_NAME]
-                    if not np.isnan(val):
-                        day_labels[stock] = float(val)
+                    val = df.loc[(stock, date), config.LABEL_NAME]
+                    if not math.isnan(float(val)):
+                        day_rets[stock] = float(val)
                 except KeyError:
                     pass
 
-            if len(day_labels) < 2:
+            if len(day_rets) < 2:
                 continue
 
-            # Convert to cross-sectional rank (0 = worst, 1 = best)
-            sorted_stocks = sorted(day_labels, key=day_labels.get)  # type: ignore
+            # cross-sectional rank: 0 = worst, 1 = best
+            sorted_stocks = sorted(day_rets, key=day_rets.get)  # type: ignore
             n = len(sorted_stocks)
             rank_map = {s: i / (n - 1) for i, s in enumerate(sorted_stocks)}
 
             for stock, rank in rank_map.items():
-                if date in windows.get(stock, {}):
-                    self.windows.append(windows[stock][date])
-                    self.labels.append(rank)
+                self.X.append(windows[stock][date])
+                self.y.append(rank)
 
     def __len__(self) -> int:
-        return len(self.labels)
+        return len(self.y)
 
     def __getitem__(self, idx: int):
         return (
-            torch.from_numpy(self.windows[idx]),
-            torch.tensor(self.labels[idx], dtype=torch.float32),
+            torch.from_numpy(self.X[idx]),
+            torch.tensor(self.y[idx], dtype=torch.float32),
         )
 
 
 # ---------------------------------------------------------------------------
-# High-level builder  (called from train.py)
+# High-level builder (called from train.py / evaluate.py)
 # ---------------------------------------------------------------------------
 
 def build_datasets(
     seq_len: int = config.SEQ_LEN,
 ) -> Tuple[
-    PairDataset, PairDataset,           # enc_train, enc_valid
-    StockDataset, StockDataset, StockDataset,  # pred_train, pred_valid, pred_test
-    pd.DataFrame,                       # full labels df (for evaluate.py)
+    PairDataset, PairDataset,
+    StockDataset, StockDataset, StockDataset,
+    pd.DataFrame,
 ]:
-    """
-    Load qlib data and construct all datasets needed for both training stages.
-    """
+    """Load qlib data and construct all datasets for both training stages."""
     init_qlib()
 
     print("Loading features from qlib …")
-    # Load enough history before TRAIN_START to fill the initial window
-    from datetime import datetime, timedelta
-    extra_days = seq_len * 2  # conservative buffer for weekends/holidays
+    # Load a buffer of extra history before TRAIN_START so the first window
+    # on TRAIN_START has enough look-back data.
+    from datetime import datetime as _dt, timedelta
     history_start = (
-        datetime.strptime(config.TRAIN_START, "%Y-%m-%d")
-        - timedelta(days=extra_days)
+        _dt.strptime(config.TRAIN_START, "%Y-%m-%d")
+        - timedelta(days=seq_len * 2)
     ).strftime("%Y-%m-%d")
 
-    df = load_raw_features(history_start, config.TEST_END)
+    df = load_raw_data(history_start, config.TEST_END)
 
-    # --- dates per split ---
     cal = df.index.get_level_values("datetime").unique().sort_values()
 
     def _dates(start: str, end: str) -> List[pd.Timestamp]:
-        s = pd.Timestamp(start)
-        e = pd.Timestamp(end)
+        s, e = pd.Timestamp(start), pd.Timestamp(end)
         return [d for d in cal if s <= d <= e]
 
     train_dates = _dates(config.TRAIN_START, config.TRAIN_END)
@@ -326,29 +372,26 @@ def build_datasets(
     stocks = df.index.get_level_values("instrument").unique().tolist()
 
     print(f"  Stocks in universe : {len(stocks)}")
-    print(f"  Train dates        : {len(train_dates)} ({train_dates[0].date()} → {train_dates[-1].date()})")
-    print(f"  Valid dates        : {len(valid_dates)} ({valid_dates[0].date()} → {valid_dates[-1].date()})")
-    print(f"  Test  dates        : {len(test_dates)} ({test_dates[0].date()} → {test_dates[-1].date()})")
+    print(f"  Train dates        : {len(train_dates)} "
+          f"({train_dates[0].date()} → {train_dates[-1].date()})")
+    print(f"  Valid dates        : {len(valid_dates)} "
+          f"({valid_dates[0].date()} → {valid_dates[-1].date()})")
+    print(f"  Test  dates        : {len(test_dates)} "
+          f"({test_dates[0].date()} → {test_dates[-1].date()})")
 
-    # --- build feature windows (covers the full date range) ---
     print("Building feature windows …")
-    all_dates = _dates(history_start, config.TEST_END)
-    windows   = _build_windows(df, stocks, seq_len)
+    windows = _build_windows(df, stocks, seq_len)
 
-    # --- stage-1 datasets ---
     print("Building PairDatasets (stage-1) …")
-    enc_train = PairDataset(windows, train_dates)
-    enc_valid = PairDataset(windows, valid_dates)
-
+    enc_train = PairDataset(windows, df, train_dates)
+    enc_valid = PairDataset(windows, df, valid_dates)
     print(f"  enc_train pairs : {len(enc_train):,}")
     print(f"  enc_valid pairs : {len(enc_valid):,}")
 
-    # --- stage-2 datasets ---
     print("Building StockDatasets (stage-2) …")
     pred_train = StockDataset(windows, df, train_dates)
     pred_valid = StockDataset(windows, df, valid_dates)
     pred_test  = StockDataset(windows, df, test_dates)
-
     print(f"  pred_train samples : {len(pred_train):,}")
     print(f"  pred_valid samples : {len(pred_valid):,}")
     print(f"  pred_test  samples : {len(pred_test):,}")

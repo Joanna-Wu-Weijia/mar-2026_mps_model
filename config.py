@@ -42,9 +42,16 @@ FEATURE_FIELDS = [
 ]
 FEATURE_NAMES = ["open_ret", "high_ret", "low_ret", "close_ret", "vol_chg", "vwap_ret"]
 
-# Label: next-day close return used to rank stocks
+# Label: next-day close return used to rank stocks (stage-2 target)
 LABEL_FIELD = "Ref($close,-1)/$close-1"   # 1-day forward return
 LABEL_NAME  = "label"
+
+# Future close ratios loaded for co-movement labels (stage-1 pretext task).
+# Matching the original MPS build_data.ipynb: correlation of FUTURE close
+# price sequences between stock pairs is used as the supervision signal.
+# close_fwd_i = Ref($close,-i)/$close  (future close normalised by today's close)
+FUTURE_CLOSE_FIELDS = [f"Ref($close,{-i})/$close" for i in range(1, 21)]
+FUTURE_CLOSE_NAMES  = [f"fwd_close_{i}" for i in range(1, 21)]
 
 # ---------------------------------------------------------------------------
 # Window sizes
@@ -52,10 +59,14 @@ LABEL_NAME  = "label"
 SEQ_LEN    = 20    # look-back window (trading days)
 N_FEATURES = 6     # number of features per timestep
 
-# Correlation horizons for co-movement labels (stage-1 pre-training)
-CORR_SHORT  = 5
-CORR_MID    = 10
-CORR_LONG   = 20   # same as SEQ_LEN
+# Co-movement label horizons (matches build_data.ipynb)
+# corr1:  correlation of close prices over next 1 day  (2 points)
+# corr5:  correlation of close prices over next 5 days (6 points)
+# corr20: correlation of close prices over next 20 days (21 points)
+# Classes: 0 = uncorrelated, 1 = positively correlated, 2 = negatively correlated
+CORR_SHORT  = 1
+CORR_MID    = 5
+CORR_LONG   = 20
 
 # Number of stock pairs sampled per date during stage-1 training
 PAIRS_PER_DATE = 200
@@ -69,8 +80,8 @@ N_HEADS  = 1
 PF_DIM   = 30
 DROPOUT  = 0.3
 
-GRU_HIDDEN  = 32
-GRU_LAYERS  = 1
+GRU_HIDDEN  = 30     # matches original MPS notebook (hidden_size=30)
+GRU_LAYERS  = 2     # matches original MPS notebook (num_layers=2)
 
 # ---------------------------------------------------------------------------
 # Training
