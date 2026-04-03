@@ -1,9 +1,6 @@
 """
 Data loading and preprocessing for the MPS model using local qlib data.
 
-Processing pipeline mirrors build_data.ipynb from ECNU-CILAB/MPS, except
-that raw data comes from a local qlib store instead of qsdata.
-
 Key design decisions that match the original exactly:
   1. Features    : raw OHLCV ["open","close","high","low","turnover","volume"]
   2. Zero-filter : drop rows where volume=0 or turnover=0  (original: same)
