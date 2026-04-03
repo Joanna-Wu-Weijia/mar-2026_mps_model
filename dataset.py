@@ -463,33 +463,16 @@ class PairDataset(Dataset):
 
 class StockDataset(Dataset):
     """
-<<<<<<< HEAD
     Each sample: (window, rank_label)
       window     : float32  (seq_len, n_features)
       rank_label : float32  cross-sectional rank in [0, 1]
-=======
-    Each sample: (window, rank_label, raw_return)
-      window      : float32  (seq_len, n_features)  newest-first
-      rank_label  : float32  cross-sectional rank [0,1]  (training target)
-      raw_return  : float32  actual 1-day forward return (for IC / Sharpe)
-
-    Attributes:
-      self.dates       : List[pd.Timestamp]   date for each sample
-      self.raw_returns : List[float]          raw return for each sample
->>>>>>> cee1879ef04398602959e355d8d5e56b07c326f9
     """
 
     def __init__(
         self,
-<<<<<<< HEAD
         windows:   dict[str, dict[pd.Timestamp, np.ndarray]],
         df:        pd.DataFrame,   # needs 'label' column (1-day fwd return)
         dates:     List[pd.Timestamp],
-=======
-        windows: Dict[str, Dict[pd.Timestamp, np.ndarray]],
-        df:      pd.DataFrame,
-        dates:   List[pd.Timestamp],
->>>>>>> cee1879ef04398602959e355d8d5e56b07c326f9
     ):
         self.X: List[np.ndarray] = []
         self.y: List[float]      = []
@@ -518,18 +501,10 @@ class StockDataset(Dataset):
             if len(day_rets) < 2:
                 continue
 
-<<<<<<< HEAD
             # cross-sectional rank: 0 = worst, 1 = best
             sorted_stocks = sorted(day_rets, key=day_rets.get)  # type: ignore
             n = len(sorted_stocks)
             rank_map = {s: i / (n - 1) for i, s in enumerate(sorted_stocks)}
-=======
-            # cross-sectional rank: 0 = worst return, 1 = best return
-            # matches groupby('dt')['close_rtn'].rank() / max(rank) in original
-            sorted_s = sorted(day_rets, key=day_rets.get)   # type: ignore
-            n        = len(sorted_s)
-            rank_map = {s: i / (n - 1) for i, s in enumerate(sorted_s)}
->>>>>>> cee1879ef04398602959e355d8d5e56b07c326f9
 
             for stock, rank in rank_map.items():
                 self.X.append(windows[stock][date])
@@ -556,7 +531,6 @@ def build_datasets(
     seq_len: int = config.SEQ_LEN,
 ) -> Tuple[
     PairDataset,
-<<<<<<< HEAD
     StockDataset, StockDataset,
     pd.DataFrame,
 ]:
@@ -567,19 +541,6 @@ def build_datasets(
     # Load a buffer of extra history before TRAIN_START so the first window
     # on TRAIN_START has enough look-back data.
     from datetime import datetime as _dt, timedelta
-=======
-    StockDataset,
-    StockDataset,
-    pd.DataFrame,
-]:
-    """
-    Load qlib data, normalise (train stats → test), build all datasets.
-    No validation split.
-    """
-    init_qlib()
-
-    print("Loading features from qlib …")
->>>>>>> cee1879ef04398602959e355d8d5e56b07c326f9
     history_start = (
         _dt.strptime(config.TRAIN_START, "%Y-%m-%d")
         - timedelta(days=seq_len * 2)
