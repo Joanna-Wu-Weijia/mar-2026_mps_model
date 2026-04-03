@@ -27,16 +27,12 @@ TRAIN_END   = "2024-12-31"
 TEST_START  = "2025-01-01"   
 TEST_END    = "2026-03-20"
 
-# Feature set (6 daily features, all normalised relative to previous close)
-FEATURE_FIELDS = [
-    "$open/Ref($close,1)-1",
-    "$high/Ref($close,1)-1",
-    "$low/Ref($close,1)-1",
-    "$close/Ref($close,1)-1",
-    "Log($volume/Ref($volume,1)+1e-8)",
-    "$vwap/Ref($close,1)-1",
-]
-FEATURE_NAMES = ["open_ret", "high_ret", "low_ret", "close_ret", "vol_chg", "vwap_ret"]
+# Feature set – raw OHLCV, matching build_data.ipynb exactly.
+# Original: ["open", "close", "high", "low", "turnover", "volume"]
+# qlib fields: $amount corresponds to "turnover" (traded value in yuan).
+# Global 3-sigma clip + z-score normalisation (train stats applied to test).
+FEATURE_FIELDS = ["$open", "$close", "$high", "$low", "$amount", "$volume"]
+FEATURE_NAMES  = ["open", "close", "high", "low", "turnover", "volume"]
 
 # Label: next-day close return used to rank stocks (stage-2 target)
 LABEL_FIELD = "Ref($close,-1)/$close-1"   # 1-day forward return
