@@ -22,9 +22,9 @@ PREDICTOR_SAVE_PATH = os.path.join(MODEL_DIR, "predictor.pt")
 UNIVERSE    = "csi300"       # instrument pool  (csi300 / csi500 / all)
 
 TRAIN_START = "2020-01-02"
-TRAIN_END   = "2024-12-31"   # ~80 % of all trading days
+TRAIN_END   = "2024-12-31"   
 
-TEST_START  = "2025-01-01"   # ~20 % held-out test
+TEST_START  = "2025-01-01"   
 TEST_END    = "2026-03-20"
 
 # Feature set (6 daily features, all normalised relative to previous close)
