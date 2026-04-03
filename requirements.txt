@@ -1,0 +1,16 @@
+# Core ML
+torch>=2.2.0
+numpy>=1.26.0
+pandas>=2.1.0
+scipy>=1.12.0
+scikit-learn>=1.4.0
+
+# Qlib (Microsoft, used for local data loading)
+# Install via: pip install pyqlib
+pyqlib>=0.9.5
+
+# Progress bars
+tqdm>=4.66.0
+
+# Plotting (optional, for notebook exploration)
+matplotlib>=3.8.0
