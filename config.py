@@ -13,22 +13,18 @@ QLIB_DATA_PATH = os.path.expanduser("~/Desktop/my_qlib_data")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "saved_models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-ENCODER_SAVE_PATH = os.path.join(MODEL_DIR, "encoder.pt")
+ENCODER_SAVE_PATH   = os.path.join(MODEL_DIR, "encoder.pt")
 PREDICTOR_SAVE_PATH = os.path.join(MODEL_DIR, "predictor.pt")
 
 # ---------------------------------------------------------------------------
-# Data
+# Data  –  strict 80 / 20 chronological split, NO validation set
 # ---------------------------------------------------------------------------
-UNIVERSE = "csi300"          # instrument pool (csi300 / csi500 / all)
-START_DATE = "2020-01-02"
-END_DATE   = "2026-03-20"
+UNIVERSE    = "csi300"       # instrument pool  (csi300 / csi500 / all)
 
-# 80 / 20 chronological split
 TRAIN_START = "2020-01-02"
-TRAIN_END   = "2024-06-30"   # ~80 % of all trading days
-VALID_START = "2024-07-01"   # held-out validation (part of the 80 % block)
-VALID_END   = "2024-12-31"
-TEST_START  = "2025-01-01"   # ~20 % test
+TRAIN_END   = "2024-12-31"   # ~80 % of all trading days
+
+TEST_START  = "2025-01-01"   # ~20 % held-out test
 TEST_END    = "2026-03-20"
 
 # Feature set (6 daily features, all normalised relative to previous close)
@@ -46,23 +42,19 @@ FEATURE_NAMES = ["open_ret", "high_ret", "low_ret", "close_ret", "vol_chg", "vwa
 LABEL_FIELD = "Ref($close,-1)/$close-1"   # 1-day forward return
 LABEL_NAME  = "label"
 
-# Future close ratios loaded for co-movement labels (stage-1 pretext task).
-# Matching the original MPS build_data.ipynb: correlation of FUTURE close
-# price sequences between stock pairs is used as the supervision signal.
-# close_fwd_i = Ref($close,-i)/$close  (future close normalised by today's close)
+# Future close ratios for co-movement labels (stage-1 pretext task).
+# Ref($close,-i)/$close = future close / today's close, for i = 1..20
 FUTURE_CLOSE_FIELDS = [f"Ref($close,{-i})/$close" for i in range(1, 21)]
 FUTURE_CLOSE_NAMES  = [f"fwd_close_{i}" for i in range(1, 21)]
 
 # ---------------------------------------------------------------------------
-# Window sizes
+# Window / co-movement parameters  (from paper Section 3)
 # ---------------------------------------------------------------------------
-SEQ_LEN    = 20    # look-back window (trading days)
-N_FEATURES = 6     # number of features per timestep
+SEQ_LEN    = 20    # look-back window q
+N_FEATURES = 6
 
-# Co-movement label horizons (matches build_data.ipynb)
-# corr1:  correlation of close prices over next 1 day  (2 points)
-# corr5:  correlation of close prices over next 5 days (6 points)
-# corr20: correlation of close prices over next 20 days (21 points)
+# k_short=1, k_mid=5, k_long=20  (paper Section 3)
+# Correlation boundaries: r1=2/3, r2=-1/3 (short); r1=0.5, r2=-0.5 (mid/long)
 # Classes: 0 = uncorrelated, 1 = positively correlated, 2 = negatively correlated
 CORR_SHORT  = 1
 CORR_MID    = 5
@@ -72,25 +64,32 @@ CORR_LONG   = 20
 PAIRS_PER_DATE = 200
 
 # ---------------------------------------------------------------------------
-# Model architecture
+# Model architecture  (from paper / original notebook)
 # ---------------------------------------------------------------------------
-HID_DIM  = 6     # == N_FEATURES (no projection; transformer works in feature space)
+HID_DIM  = 6     # transformer hidden dim == N_FEATURES (no input projection)
 N_LAYERS = 1
-N_HEADS  = 1
+N_HEADS  = 1     # h = 1  (paper Section 3)
 PF_DIM   = 30
 DROPOUT  = 0.3
 
-GRU_HIDDEN  = 30     # matches original MPS notebook (hidden_size=30)
-GRU_LAYERS  = 2     # matches original MPS notebook (num_layers=2)
+GRU_HIDDEN = 30   # original notebook: hidden_size=30
+GRU_LAYERS = 2    # original notebook: num_layers=2
 
 # ---------------------------------------------------------------------------
-# Training
+# Training  –  fixed epochs, no early stopping (no validation set)
 # ---------------------------------------------------------------------------
 BATCH_SIZE   = 256
 LR           = 1e-4
-N_EPOCHS_ENC = 25    # stage-1 (encoder / co-movement)
-N_EPOCHS_PRE = 25    # stage-2 (predictor / return ranking)
-PATIENCE     = 5     # early-stopping patience (epochs)
+N_EPOCHS_ENC = 25    # stage-1 encoder training epochs
+N_EPOCHS_PRE = 25    # stage-2 predictor training epochs
+
+# ---------------------------------------------------------------------------
+# Evaluation metrics
+# ---------------------------------------------------------------------------
+# Sharpe Ratio: annualised Sharpe of the long-top-K portfolio on test days
+TOP_K_PCT        = 0.10    # select top 10 % of stocks by predicted score
+ANNUAL_FACTOR    = 252     # trading days per year for annualisation
+RISK_FREE_RATE   = 0.0     # daily risk-free rate (set to 0 for simplicity)
 
 # ---------------------------------------------------------------------------
 # Device  (CUDA > Apple-Silicon MPS > CPU)
