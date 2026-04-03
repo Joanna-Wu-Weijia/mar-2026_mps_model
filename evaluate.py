@@ -17,6 +17,7 @@ Metrics reported
 from __future__ import annotations
 
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict
 
 import numpy as np
@@ -44,6 +45,9 @@ def _collect_predictions(
     Run predictor on every sample in dataset (preserving order).
     Returns dict with keys: scores, ranks, raw_returns, dates.
     """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+
     predictor.eval()
     encoder.eval()
 
@@ -62,10 +66,20 @@ def _collect_predictions(
         ranks_all.extend(rank.numpy().tolist())
         rets_all.extend(raw_ret.numpy().tolist())
 
+    scores = np.array(scores_all, dtype=np.float64)
+    ranks = np.array(ranks_all, dtype=np.float64)
+    raw_returns = np.array(rets_all, dtype=np.float64)
+
+    if len(dataset.dates) != len(scores):
+        raise ValueError(
+            "Length mismatch: dataset.dates and model outputs do not align "
+            f"({len(dataset.dates)} vs {len(scores)})"
+        )
+
     return {
-        "scores":      np.array(scores_all),
-        "ranks":       np.array(ranks_all),
-        "raw_returns": np.array(rets_all),
+        "scores":      scores,
+        "ranks":       ranks,
+        "raw_returns": raw_returns,
         "dates":       dataset.dates,          # List[pd.Timestamp]
     }
 
@@ -75,6 +89,8 @@ def _collect_predictions(
 # ---------------------------------------------------------------------------
 
 def _mse(scores: np.ndarray, ranks: np.ndarray) -> float:
+    if scores.size == 0 or ranks.size == 0:
+        return float("nan")
     return float(np.mean((scores - ranks) ** 2))
 
 
@@ -83,6 +99,8 @@ def _accuracy(scores: np.ndarray, ranks: np.ndarray) -> float:
     Directional accuracy: fraction of stocks correctly predicted as
     top-half (rank >= 0.5) vs bottom-half (rank < 0.5).
     """
+    if scores.size == 0 or ranks.size == 0:
+        return float("nan")
     pred_top   = scores >= 0.5
     actual_top = ranks  >= 0.5
     return float(np.mean(pred_top == actual_top))
@@ -90,7 +108,16 @@ def _accuracy(scores: np.ndarray, ranks: np.ndarray) -> float:
 
 def _daily_ic(data: dict, use_spearman: bool = False) -> np.ndarray:
     """Compute per-day IC series between predicted scores and raw returns."""
-    from scipy.stats import spearmanr
+    spearmanr = None
+    if use_spearman:
+        try:
+            from scipy.stats import spearmanr as _spearmanr
+            spearmanr = _spearmanr
+        except ImportError as exc:
+            raise ImportError(
+                "Spearman IC requested but scipy is not installed. "
+                "Install scipy or set use_spearman=False."
+            ) from exc
 
     by_date: dict[object, list] = defaultdict(list)
     for score, ret, date in zip(data["scores"], data["raw_returns"], data["dates"]):
@@ -110,7 +137,7 @@ def _daily_ic(data: dict, use_spearman: bool = False) -> np.ndarray:
         if not np.isnan(ic):
             ic_series.append(ic)
 
-    return np.array(ic_series)
+    return np.array(ic_series, dtype=np.float64)
 
 
 def _sharpe(data: dict) -> float:
@@ -124,7 +151,11 @@ def _sharpe(data: dict) -> float:
         by_date[date].append((score, ret))
 
     port_rets = []
-    k_pct = config.TOP_K_PCT
+    k_pct = float(config.TOP_K_PCT)
+    if k_pct <= 0:
+        return float("nan")
+    if k_pct > 1:
+        k_pct = 1.0
 
     for date in sorted(by_date):
         pairs = sorted(by_date[date], key=lambda x: x[0], reverse=True)
@@ -135,7 +166,7 @@ def _sharpe(data: dict) -> float:
     if len(port_rets) < 2:
         return float("nan")
 
-    port_rets = np.array(port_rets) - config.RISK_FREE_RATE
+    port_rets = np.array(port_rets, dtype=np.float64) - float(config.RISK_FREE_RATE)
     mean_r = float(np.mean(port_rets))
     std_r  = float(np.std(port_rets, ddof=1))
     if std_r < 1e-8:
@@ -164,10 +195,25 @@ def compute_all_metrics(
         If True, use Spearman rank IC (RankIC). Default: Pearson IC.
     """
     data = _collect_predictions(predictor, encoder, dataset, device)
+    if data["scores"].size == 0:
+        return {
+            "MSE": float("nan"),
+            "Accuracy": float("nan"),
+            "IC": float("nan"),
+            "ICIR": float("nan"),
+            "Sharpe": float("nan"),
+        }
 
     ic_series = _daily_ic(data, use_spearman=use_spearman)
-    mean_ic   = float(np.mean(ic_series))
-    icir      = float(mean_ic / (np.std(ic_series, ddof=1) + 1e-8))
+    if ic_series.size == 0:
+        mean_ic = float("nan")
+        icir = float("nan")
+    elif ic_series.size == 1:
+        mean_ic = float(ic_series[0])
+        icir = float("nan")
+    else:
+        mean_ic = float(np.mean(ic_series))
+        icir = float(mean_ic / (np.std(ic_series, ddof=1) + 1e-8))
 
     return {
         "MSE":      _mse(data["scores"], data["ranks"]),
@@ -210,8 +256,11 @@ def main() -> None:
         dropout  = config.DROPOUT,
         device   = device,
     ).to(device)
+    encoder_path = Path(config.ENCODER_SAVE_PATH)
+    if not encoder_path.exists():
+        raise FileNotFoundError(f"Encoder checkpoint not found: {encoder_path}")
     encoder.load_state_dict(
-        torch.load(config.ENCODER_SAVE_PATH, map_location=device))
+        torch.load(encoder_path, map_location=device))
     encoder.eval()
 
     predictor = GRU_Predict(
@@ -220,8 +269,11 @@ def main() -> None:
         gru_hidden = config.GRU_HIDDEN,
         gru_layers = config.GRU_LAYERS,
     ).to(device)
+    predictor_path = Path(config.PREDICTOR_SAVE_PATH)
+    if not predictor_path.exists():
+        raise FileNotFoundError(f"Predictor checkpoint not found: {predictor_path}")
     predictor.load_state_dict(
-        torch.load(config.PREDICTOR_SAVE_PATH, map_location=device))
+        torch.load(predictor_path, map_location=device))
     predictor.eval()
 
     metrics = compute_all_metrics(predictor, encoder, pred_test, device)
