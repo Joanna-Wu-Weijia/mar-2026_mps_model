@@ -38,17 +38,12 @@ from qlib.data import D
 import config
 
 
-# ---------------------------------------------------------------------------
 # Qlib initialisation
-# ---------------------------------------------------------------------------
-
 def init_qlib() -> None:
     qlib.init(provider_uri=config.QLIB_DATA_PATH, region="cn")
 
 
-# ---------------------------------------------------------------------------
-# Raw feature + label loading
-# ---------------------------------------------------------------------------
+# Raw feature
 
 def load_raw_data(start: str, end: str) -> pd.DataFrame:
     """
@@ -81,10 +76,7 @@ def load_raw_data(start: str, end: str) -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
-# Global normalisation  (mirrors build_data.ipynb normalisation block)
-# ---------------------------------------------------------------------------
-
+# normalisation
 def _zscore_clip(x: np.ndarray) -> np.ndarray:
     mu  = np.nanmean(x, axis=0, keepdims=True)
     std = np.nanstd(x,  axis=0, keepdims=True) + 1e-8
@@ -92,10 +84,8 @@ def _zscore_clip(x: np.ndarray) -> np.ndarray:
     return np.clip(z, -3.0, 3.0).astype(np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Window builder
-# ---------------------------------------------------------------------------
 
+# Window builder 切割时间
 def _build_windows(
     df: pd.DataFrame,
     stocks: List[str],
@@ -135,9 +125,7 @@ def _build_windows(
     return windows
 
 
-# ---------------------------------------------------------------------------
-# Co-movement correlation helpers (original MPS convention)
-# ---------------------------------------------------------------------------
+# Co-movement correlation (original MPS convention) 股票配对
 
 def _pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
     """Pearson correlation; returns 0.0 when one series is constant."""
@@ -213,9 +201,7 @@ def _future_corr_labels(
     return l_short, l_mid, l_long
 
 
-# ---------------------------------------------------------------------------
 # PairDataset – stage-1
-# ---------------------------------------------------------------------------
 
 class PairDataset(Dataset):
     """
