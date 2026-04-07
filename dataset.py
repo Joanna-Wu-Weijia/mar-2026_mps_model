@@ -1,11 +1,6 @@
 """
-Data loading and preprocessing for the MPS model using local qlib data.
-
-Data directory layout (set QLIB_DATA_PATH in config.py):
-    my_qlib_data/
-    ├── calendars/day.txt
-    ├── features/<stock>/close.day.bin ...
-    └── instruments/csi300.txt ...
+Data loading and preprocessing for the MPS model using local qlib data on Desktop.
+如果需要运行请修改路径！！
 
 Two Dataset classes:
   PairDataset   – stage-1 (MultiTask co-movement pre-training)
@@ -201,7 +196,7 @@ def _future_corr_labels(
     return l_short, l_mid, l_long
 
 
-# PairDataset – stage-1
+# PairDataset – stage-1 预训练 - 对比股票
 
 class PairDataset(Dataset):
     """
@@ -239,7 +234,7 @@ class PairDataset(Dataset):
             while pairs_added < n and attempts < n * 5:
                 attempts += 1
                 a, b = rng.sample(avail, 2)
-                key  = (min(a, b), max(a, b))
+                key  = (min(a, b), max(a, b)) #确保不会被重复计算
                 if key in sampled:
                     continue
                 sampled.add(key)
@@ -266,9 +261,8 @@ class PairDataset(Dataset):
         )
 
 
-# ---------------------------------------------------------------------------
+
 # StockDataset – stage-2
-# ---------------------------------------------------------------------------
 
 class StockDataset(Dataset):
     """
@@ -307,6 +301,7 @@ class StockDataset(Dataset):
                 continue
 
             # cross-sectional rank: 0 = worst, 1 = best
+            # 截面排名
             sorted_stocks = sorted(day_rets, key=day_rets.get)  # type: ignore
             n = len(sorted_stocks)
             rank_map = {s: i / (n - 1) for i, s in enumerate(sorted_stocks)}
@@ -328,9 +323,8 @@ class StockDataset(Dataset):
         )
 
 
-# ---------------------------------------------------------------------------
-# High-level builder (called from train.py / evaluate.py)
-# ---------------------------------------------------------------------------
+# High-level builder
+# called from train.py / evaluate.pys
 
 def build_datasets(
     seq_len: int = config.SEQ_LEN,
@@ -348,15 +342,13 @@ def build_datasets(
     from datetime import datetime as _dt, timedelta
     history_start = (
         _dt.strptime(config.TRAIN_START, "%Y-%m-%d")
-        - timedelta(days=seq_len * 2)
+        - timedelta(days=seq_len * 2) #考虑非交易日（周末节假日啥的）
     ).strftime("%Y-%m-%d")
 
     df = load_raw_data(history_start, config.TEST_END)
 
-    # ------------------------------------------------------------------ #
-    # Global normalisation – fit on training slice, apply same params     #
-    # to test slice.  Matches build_data.ipynb normalisation block.       #
-    # ------------------------------------------------------------------ #
+    # Global normalisation – fit on training slice, apply same params to test slice.      
+    
     print("Normalising (train-stats applied to test) …")
     df, _ = normalise_split(df, config.TRAIN_END, config.FEATURE_NAMES)
 
