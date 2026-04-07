@@ -13,9 +13,7 @@ import torch
 import torch.nn as nn
 
 
-# ---------------------------------------------------------------------------
 # Building blocks
-# ---------------------------------------------------------------------------
 
 class MultiHeadAttentionLayer(nn.Module):
     def __init__(self, hid_dim: int, n_heads: int, dropout: float, device):
@@ -56,7 +54,7 @@ class MultiHeadAttentionLayer(nn.Module):
         return x, attention
 
 
-class FeedforwardLayer(nn.Module):
+class FeedforwardLayer(nn.Module): #逐位置前馈网络
     def __init__(self, hid_dim: int, pf_dim: int, dropout: float):
         super().__init__()
         self.fc_1    = nn.Linear(hid_dim, pf_dim)
@@ -108,10 +106,12 @@ class TransformerEncoder(nn.Module):
         return src
 
 
-# ---------------------------------------------------------------------------
-# Stage-1 : Multi-scale encoder with co-movement heads
-# ---------------------------------------------------------------------------
 
+# Stage-1 : Multi-scale encoder with co-movement heads
+# 通过学习两只股票在未来不同时间尺度上的走势是否同步，来训练出一个能够捕捉深层市场特征的特征encoder
+
+# 2.1 - Multi-scale Time Based Encoder
+# 对应论文中定义的 alpha = {short, middle, long\ 三种时间跨度
 class Encoder(nn.Module):
     """Three independent transformer encoders (short / mid / long scale)."""
 
@@ -132,7 +132,7 @@ class Encoder(nn.Module):
                 self.middle_encoder(src),
                 self.long_encoder(src))
 
-
+# 2.2
 class MultiTask(nn.Module):
     """
     Stage-1 model.
@@ -159,7 +159,7 @@ class MultiTask(nn.Module):
         self.nn_middle = nn.Sequential(nn.Linear(flat_dim, 30), nn.ReLU(), nn.Linear(30, 3))
         self.nn_long   = nn.Sequential(nn.Linear(flat_dim, 30), nn.ReLU(), nn.Linear(30, 3))
 
-    def forward(self, srcA, srcB):
+    def forward(self, srcA, srcB): # 同时接收股票 A 和 B 的特征窗口，随机选择股票对进行训练的方法
         sA, mA, lA = self.encoder(srcA)
         sB, mB, lB = self.encoder(srcB)
 
@@ -169,7 +169,9 @@ class MultiTask(nn.Module):
         long_enc   = torch.cat([lA, lB], dim=1)
 
         # Global context: all scales
+
         context = torch.cat([short_enc, middle_enc, long_enc], dim=1)
+               # 将联动预测定义为三分类问题
 
         short_att,  _ = self.att_short(short_enc,  context, context)
         middle_att, _ = self.att_middle(middle_enc, context, context)
@@ -183,9 +185,8 @@ class MultiTask(nn.Module):
         return short_score, middle_score, long_score
 
 
-# ---------------------------------------------------------------------------
 # Stage-2 : GRU predictor on frozen encoder representations
-# ---------------------------------------------------------------------------
+# 把第一部分学到的三种时间维度的市场表征结合在一起，通过 GRU 最后的时序过滤，给每只股票打未来表现潜力分数
 
 class GRU_Predict(nn.Module):
     """
